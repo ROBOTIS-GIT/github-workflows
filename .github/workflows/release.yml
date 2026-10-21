@@ -1,0 +1,133 @@
+name: Reusable release
+
+on:
+  workflow_call:
+    inputs:
+      source_branch:
+        description: Source branch for Bump PRs
+        type: string
+        default: main
+      target_branch:
+        description: Target branch for Bump PRs
+        type: string
+        default: jazzy
+
+permissions:
+  contents: read
+
+# Keep edits and merge events for the same PR from cancelling one another.
+concurrency:
+  group: release-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    if: github.event.action != 'closed' || github.event.pull_request.merged == true
+    outputs:
+      version: ${{ steps.validate.outputs.version }}
+    steps:
+      - name: Validate Bump version and release notes
+        id: validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import re
+          from urllib.error import HTTPError
+          from urllib.request import Request, urlopen
+
+          def fail(message):
+              raise SystemExit(message)
+
+          def get(path):
+              request = Request(
+                  f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/{path}",
+                  headers={
+                      "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              try:
+                  with urlopen(request, timeout=30) as response:
+                      return json.load(response)
+              except HTTPError as error:
+                  if error.code == 404:
+                      return None
+                  raise
+
+          def version_parts(value):
+              if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", value):
+                  fail("Version must have the format X.Y.Z without leading zeroes.")
+              return tuple(map(int, value.split(".")))
+
+          def main():
+              with open(os.environ["GITHUB_EVENT_PATH"]) as event_file:
+                  pr = json.load(event_file)["pull_request"]
+              if (
+                  pr["base"]["ref"] != os.environ["TARGET_BRANCH"]
+                  or pr["head"]["ref"] != os.environ["SOURCE_BRANCH"]
+                  or (pr["head"]["repo"] or {}).get("full_name") != os.environ["GITHUB_REPOSITORY"]
+                  or not re.match(r"^Bump\b", pr["title"])
+              ):
+                  print("Not a matching Bump PR; no release required.")
+                  return
+
+              match = re.fullmatch(r"Bump ([0-9]+\.[0-9]+\.[0-9]+)", pr["title"])
+              if not match:
+                  fail("Release PR title must be exactly 'Bump X.Y.Z'.")
+              version = match.group(1)
+              candidate = version_parts(version)
+              notes = re.sub(r"<!--.*?-->", "", pr["body"] or "", flags=re.DOTALL)
+              if not notes.strip():
+                  fail("PR Description must contain release notes, not just whitespace or HTML comments.")
+
+              latest = get("releases/latest")
+              if latest is not None:
+                  latest_version = latest["tag_name"].removeprefix("v")
+                  if candidate <= version_parts(latest_version):
+                      fail(f"Version {version} must be greater than latest release {latest['tag_name']}.")
+              if get(f"releases/tags/{version}") is not None:
+                  fail(f"Release {version} already exists.")
+              if get(f"git/ref/tags/{version}") is not None:
+                  fail(f"Tag {version} already exists.")
+
+              with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                  output.write(f"version={version}\n")
+              print(f"Validated release {version}.")
+
+          main()
+          PY
+
+  release:
+    name: Publish release
+    needs: validate
+    if: >-
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true &&
+      needs.validate.outputs.version != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create release at the merge commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          set -euo pipefail
+          jq -r '.pull_request.body' "$GITHUB_EVENT_PATH" > "$RUNNER_TEMP/release-notes.md"
+          gh release create "$VERSION" \
+            --target "$MERGE_SHA" \
+            --title "$VERSION" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
