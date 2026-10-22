@@ -33,9 +33,11 @@ The branch inputs default to `main` and `jazzy`. When changing `target_branch`,
 also update the caller's `pull_request.branches` filter. Keep all event types so
 changes to PR titles, descriptions, and commits trigger validation.
 
-Validation requires a strict `Bump X.Y.Z` title, a version greater than the latest
+Every same-repository PR from `source_branch` to `target_branch` is validated,
+regardless of its title. Validation requires a strict `Bump X.Y.Z` title, a version greater than the latest
 published release, no existing tag or release for that version, and a description
-containing more than whitespace or HTML comments. Other PRs pass without creating
+containing more than whitespace or HTML comments. A missing or malformed title
+fails validation instead of skipping it. PRs from other branch pairs or forks pass without creating
 a release. Versions are stable three-part numbers; prerelease suffixes are not
 supported. The latest release tag may have a `v` prefix, but new tags use `X.Y.Z`.
 

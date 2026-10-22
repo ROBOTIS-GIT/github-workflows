@@ -76,9 +76,8 @@ jobs:
                   pr["base"]["ref"] != os.environ["TARGET_BRANCH"]
                   or pr["head"]["ref"] != os.environ["SOURCE_BRANCH"]
                   or (pr["head"]["repo"] or {}).get("full_name") != os.environ["GITHUB_REPOSITORY"]
-                  or not re.match(r"^Bump\b", pr["title"])
               ):
-                  print("Not a matching Bump PR; no release required.")
+                  print("Not a matching release branch pair in this repository; no release required.")
                   return
 
               match = re.fullmatch(r"Bump ([0-9]+\.[0-9]+\.[0-9]+)", pr["title"])
