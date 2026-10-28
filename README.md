@@ -134,12 +134,11 @@ jobs:
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 ```
 
-### Automatic release integration (follow-up)
+### Automatic release integration
 
-The existing shared `release.yml` does **not yet expose** `published` or `version`
-outputs. To wire automatic publishing, first add those outputs, setting
-`published` only after successful release creation. Then add the Docker caller
-job to the same caller workflow with `needs: release`, a condition of
+The shared `release.yml` exposes `published` and `version` outputs only after
+successful release creation. Skipped publication leaves both outputs empty.
+Add the Docker caller job to the same caller workflow with `needs: release`, a condition of
 `needs.release.outputs.published == 'true'`, and version from
 `needs.release.outputs.version`. Do not rely on `release: published` to chain
 from releases created with `GITHUB_TOKEN`.
