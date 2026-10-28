@@ -63,3 +63,96 @@ workflow runs** without editing every repository. Updating this repository does
 not itself trigger releases in callers. Review and test central changes before
 merging because all callers share this reference. Pinning a commit SHA is an
 alternative when a repository needs fixed behavior instead of automatic updates.
+
+## Docker Hub publishing workflow
+
+`.github/workflows/docker-publish.yml` builds the calling repository on native
+AMD64 (`ubuntu-24.04`) and ARM64 (`ubuntu-24.04-arm`) runners. It pushes
+`amd64-X.Y.Z` and `arm64-X.Y.Z`, then combines the exact build digests into
+`X.Y.Z`. Both builds must succeed before the shared version tag is published.
+It verifies that the resulting index contains both Linux architectures.
+
+The `version` must identify an existing, published, non-prerelease GitHub Release
+in the calling repository. `latest` is updated only when that version is still
+the repository's latest GitHub Release at publication time. Set `publish_latest:
+false` to publish only the version tags. Failed builds may leave architecture
+tags in Docker Hub, but do not update the shared version or `latest` tags.
+
+### Inputs and credentials
+
+| Input | Default | Purpose |
+| --- | --- | --- |
+| `image` | Required | Docker Hub `namespace/repository`, without a tag |
+| `version` | Required | Published release tag, strictly `X.Y.Z` |
+| `checkout_ref` | `jazzy` | Branch, tag, or commit of the calling repository |
+| `context` | `.` | Build context relative to checkout |
+| `dockerfile` | `Dockerfile` | Dockerfile relative to checkout, not context |
+| `dockerfile_amd64` | Empty | Optional override for AMD64 |
+| `dockerfile_arm64` | Empty | Optional override for ARM64 |
+| `build_args` | Empty | Newline-separated non-secret build arguments |
+| `no_cache` | `true` | Disable build layer cache |
+| `publish_latest` | `true` | Allow latest-tag publication |
+
+Pass `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` explicitly as workflow secrets.
+The token needs push access to the requested Docker Hub repository. Organization
+secrets must be made available to each calling repository; storing secrets only
+in this shared-workflows repository does not make them available to callers.
+The caller needs only `contents: read` for Docker publishing.
+
+The checkout ref is resolved once and reused by both build jobs. Dockerfiles
+that clone branches internally retain their existing behavior. No ORIN, SSH
+credentials, QEMU, or GitHub personal access token is required.
+
+### Manual caller for an existing release
+
+For `robotis_applications`, save this as a workflow in the calling repository
+and run it with a published version. It also provides a way to retry Docker
+publishing without rerunning release creation.
+
+```yaml
+name: Publish Docker image
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing release version (X.Y.Z)
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  docker-publish:
+    uses: ROBOTIS-GIT/github-workflows/.github/workflows/docker-publish.yml@main
+    with:
+      image: robotis/robotis-applications
+      version: ${{ inputs.version }}
+      checkout_ref: jazzy
+      context: ./docker
+      dockerfile: ./docker/Dockerfile
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+```
+
+### Automatic release integration (follow-up)
+
+The existing shared `release.yml` does **not yet expose** `published` or `version`
+outputs. To wire automatic publishing, first add those outputs, setting
+`published` only after successful release creation. Then add the Docker caller
+job to the same caller workflow with `needs: release`, a condition of
+`needs.release.outputs.published == 'true'`, and version from
+`needs.release.outputs.version`. Do not rely on `release: published` to chain
+from releases created with `GITHUB_TOKEN`.
+
+Publication is serialized per image within the calling repository. GitHub
+concurrency retains at most one running and one pending run; a newer queued
+run can replace an older pending one. Use the manual caller to recover skipped
+versions. Assign each Docker Hub image to one calling repository because this
+lock does not coordinate different repositories. Reruns can overwrite image tags.
+`latest` selection follows GitHub's latest-release designation, not a separate
+Docker Hub version comparison.
+
+Setting `no_cache: false` permits builder-local cache use but does not configure
+persistent caching across hosted runner jobs. Initial builds should verify disk
+usage and duration against hosted runner limits. Live builds and Docker Hub
+publishing require running this workflow in a configured calling repository.

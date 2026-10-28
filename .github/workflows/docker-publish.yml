@@ -1,0 +1,213 @@
+name: Reusable Docker publish
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Docker Hub image name without a tag (namespace/repository)
+        required: true
+        type: string
+      version:
+        description: Published GitHub Release tag in X.Y.Z format
+        required: true
+        type: string
+      checkout_ref:
+        description: Calling repository ref to build
+        type: string
+        default: jazzy
+      context:
+        description: Build context relative to the checkout
+        type: string
+        default: .
+      dockerfile:
+        description: Dockerfile path relative to the checkout, not the context
+        type: string
+        default: Dockerfile
+      dockerfile_amd64:
+        description: Optional AMD64 Dockerfile override
+        type: string
+        default: ''
+      dockerfile_arm64:
+        description: Optional ARM64 Dockerfile override
+        type: string
+        default: ''
+      build_args:
+        description: Newline-separated non-secret Docker build arguments
+        type: string
+        default: ''
+      no_cache:
+        description: Build without layer cache, matching the manual release process
+        type: boolean
+        default: true
+      publish_latest:
+        description: Update latest only if version is still the latest GitHub Release
+        type: boolean
+        default: true
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: true
+      DOCKERHUB_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+# Serialize publication of the same image within the calling repository.
+concurrency:
+  group: docker-publish-${{ github.repository }}-${{ inputs.image }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      artifact_prefix: ${{ steps.validate.outputs.artifact_prefix }}
+    steps:
+      - name: Validate image, version, and published release
+        id: validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          IMAGE: ${{ inputs.image }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE" =~ ^[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*$ ]] || {
+            echo '::error::image must be a Docker Hub namespace/repository without a tag.'
+            exit 1
+          }
+          [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+            echo '::error::version must be X.Y.Z without leading zeroes.'
+            exit 1
+          }
+          gh api "repos/$GH_REPO/releases/tags/$VERSION" \
+            --jq '{draft, prerelease}' > "$RUNNER_TEMP/release.json"
+          jq -e '.draft == false and .prerelease == false' "$RUNNER_TEMP/release.json"
+          echo "artifact_prefix=docker-${IMAGE//\//-}-$VERSION-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout calling repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      - name: Resolve source once for both architectures
+        id: source
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout calling repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push architecture image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ (matrix.arch == 'amd64' && inputs.dockerfile_amd64) || (matrix.arch == 'arm64' && inputs.dockerfile_arm64) || inputs.dockerfile }}
+          platforms: linux/${{ matrix.arch }}
+          tags: ${{ inputs.image }}:${{ matrix.arch }}-${{ inputs.version }}
+          push: true
+          no-cache: ${{ inputs.no_cache }}
+          build-args: ${{ inputs.build_args }}
+
+      - name: Export build digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          mkdir -p "$RUNNER_TEMP/digests"
+          printf '%s\n' "$DIGEST" > "$RUNNER_TEMP/digests/$ARCH"
+
+      - name: Upload build digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.prepare.outputs.artifact_prefix }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download build digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ needs.prepare.outputs.artifact_prefix }}-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Publish and inspect multi-platform tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          IMAGE: ${{ inputs.image }}
+          VERSION: ${{ inputs.version }}
+          PUBLISH_LATEST: ${{ inputs.publish_latest }}
+        run: |
+          set -euo pipefail
+          amd64=$(cat "$RUNNER_TEMP/digests/amd64")
+          arm64=$(cat "$RUNNER_TEMP/digests/arm64")
+          [[ "$amd64" =~ ^sha256:[a-f0-9]{64}$ ]]
+          [[ "$arm64" =~ ^sha256:[a-f0-9]{64}$ ]]
+          docker buildx imagetools create --tag "$IMAGE:$VERSION" \
+            "$IMAGE@$amd64" "$IMAGE@$arm64"
+          docker buildx imagetools inspect "$IMAGE:$VERSION" --raw > "$RUNNER_TEMP/manifest.json"
+          jq -e '
+            [.manifests[].platform | select(.os == "linux") | .architecture]
+            | (index("amd64") != null) and (index("arm64") != null)
+          ' "$RUNNER_TEMP/manifest.json"
+          echo "Published $IMAGE:$VERSION (linux/amd64, linux/arm64)" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$PUBLISH_LATEST" == true ]]; then
+            latest=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)
+            if [[ "$latest" == "$VERSION" ]]; then
+              docker buildx imagetools create --tag "$IMAGE:latest" \
+                "$IMAGE@$amd64" "$IMAGE@$arm64"
+              docker buildx imagetools inspect "$IMAGE:latest"
+              echo "Updated $IMAGE:latest" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "Skipped latest: latest GitHub Release is $latest." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
